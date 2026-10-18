@@ -1,0 +1,3 @@
+[submodule "nrf-softsim"]
+	path = nrf-softsim
+	url = https://github.com/onomondo/nrf-softsim.git

@@ -692,6 +692,8 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 	printf("HDOP:              %.01f\n", (double)pvt_data->hdop);
 	printf("VDOP:              %.01f\n", (double)pvt_data->vdop);
 	printf("TDOP:              %.01f\n", (double)pvt_data->tdop);
+	printf("Google Maps:       https://www.google.com/maps?q=%.06f,%.06f\n",
+	       pvt_data->latitude, pvt_data->longitude);
 }
 
 int main(void)
