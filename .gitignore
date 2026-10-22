@@ -4,3 +4,6 @@
 
 # build
 /build*/
+
+# SoftSIM profile (contains K/Ki)
+/key.conf

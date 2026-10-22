@@ -8,3 +8,7 @@ config PARTITION_MANAGER
 	default n
 
 source "share/sysbuild/Kconfig"
+
+# nrf-softsim is a git submodule rather than a west module, so sysbuild does not
+# pick up its sysbuild Kconfig/CMake on its own.
+rsource "nrf-softsim/sysbuild/Kconfig"

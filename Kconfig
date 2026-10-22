@@ -62,6 +62,27 @@ config GNSS_SAMPLE_NMEA_ONLY
 
 endmenu
 
+menu "Position reporting"
+
+config TRACKER_SERVER_ADDR
+	string "Server IPv4 address"
+	help
+	  IPv4 address of the server receiving the positions over UDP.
+
+config TRACKER_SERVER_PORT
+	int "Server UDP port"
+	range 1 65535
+	default 4321
+
+config TRACKER_LTE_TIMEOUT
+	int "LTE registration timeout in seconds"
+	range 10 3600
+	default 300
+	help
+	  Maximum time to wait for network registration before giving up on sending a position.
+
+endmenu
+
 choice
 	default GNSS_SAMPLE_ASSISTANCE_NONE
 	prompt "Select whether GNSS assistance is used or not"

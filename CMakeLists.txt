@@ -7,6 +7,10 @@
 cmake_minimum_required(VERSION 3.20.0)
 list(APPEND ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_LIST_DIR}/nrf-softsim)
 list(APPEND OVERLAY_CONFIG ${CMAKE_CURRENT_LIST_DIR}/nrf-softsim/overlay-softsim.conf)
+# Local, untracked: holds CONFIG_SOFTSIM_STATIC_PROFILE_ENABLE and the profile string.
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/key.conf)
+  list(APPEND OVERLAY_CONFIG ${CMAKE_CURRENT_LIST_DIR}/key.conf)
+endif()
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(gnss)

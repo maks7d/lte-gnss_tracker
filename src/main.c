@@ -8,18 +8,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <nrf_modem_at.h>
 #include <nrf_modem_gnss.h>
 #include <modem/lte_lc.h>
 #include <modem/nrf_modem_lib.h>
 #include <date_time.h>
+#include <nrf_softsim.h>
+#include <zephyr/sys/reboot.h>
 
 LOG_MODULE_REGISTER(gnss_sample, CONFIG_GNSS_SAMPLE_LOG_LEVEL);
 
 #define PI 3.14159265358979323846
 #define EARTH_RADIUS_METERS (6371.0 * 1000.0)
+
+#define TX_WORKQ_THREAD_STACK_SIZE 3072
+#define TX_WORKQ_THREAD_PRIORITY   5
+#define TX_PAYLOAD_SIZE            192
+
+static struct k_work_q tx_work_q;
+static struct k_work position_tx_work;
+
+K_THREAD_STACK_DEFINE(tx_workq_stack_area, TX_WORKQ_THREAD_STACK_SIZE);
 
 #if !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE) || defined(CONFIG_GNSS_SAMPLE_MODE_TTFF_TEST)
 static struct k_work_q gnss_work_q;
@@ -48,6 +64,8 @@ static double time_to_fix;
 static const char update_indicator[] = {'\\', '|', '/', '-'};
 
 static struct nrf_modem_gnss_pvt_data_frame last_pvt;
+/* Most recent PVT frame with a valid fix, reported when GNSS goes to sleep after the fix. */
+static struct nrf_modem_gnss_pvt_data_frame last_valid_pvt;
 static uint64_t fix_timestamp;
 static uint32_t time_blocked;
 
@@ -75,6 +93,10 @@ BUILD_ASSERT(IS_ENABLED(CONFIG_LTE_NETWORK_MODE_LTE_M_GPS) ||
 	     "CONFIG_LTE_NETWORK_MODE_LTE_M_GPS, "
 	     "CONFIG_LTE_NETWORK_MODE_NBIOT_GPS or "
 	     "CONFIG_LTE_NETWORK_MODE_LTE_M_NBIOT_GPS must be enabled");
+
+BUILD_ASSERT(IS_ENABLED(CONFIG_GNSS_SAMPLE_MODE_PERIODIC),
+	     "Positions are reported after each periodic fix, enable "
+	     "CONFIG_GNSS_SAMPLE_MODE_PERIODIC");
 
 BUILD_ASSERT((sizeof(CONFIG_GNSS_SAMPLE_REFERENCE_LATITUDE) == 1 &&
 	      sizeof(CONFIG_GNSS_SAMPLE_REFERENCE_LONGITUDE) == 1) ||
@@ -129,8 +151,16 @@ static void gnss_event_handler(int event)
 	case NRF_MODEM_GNSS_EVT_PVT:
 		retval = nrf_modem_gnss_read(&last_pvt, sizeof(last_pvt), NRF_MODEM_GNSS_DATA_PVT);
 		if (retval == 0) {
+			if (last_pvt.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) {
+				last_valid_pvt = last_pvt;
+			}
 			k_sem_give(&pvt_data_sem);
 		}
+		break;
+
+	case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
+		/* GNSS sleeps until the next periodic fix, which leaves room for LTE. */
+		k_work_submit_to_queue(&tx_work_q, &position_tx_work);
 		break;
 
 #if defined(CONFIG_GNSS_SAMPLE_MODE_TTFF_TEST)
@@ -181,9 +211,7 @@ static void gnss_event_handler(int event)
 	}
 }
 
-#if !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE)
-#if defined(CONFIG_GNSS_SAMPLE_LTE_ON_DEMAND)
-K_SEM_DEFINE(lte_ready, 0, 1);
+static K_SEM_DEFINE(lte_ready, 0, 1);
 
 static void lte_lc_event_handler(const struct lte_lc_evt *const evt)
 {
@@ -201,25 +229,32 @@ static void lte_lc_event_handler(const struct lte_lc_evt *const evt)
 	}
 }
 
-void lte_connect(void)
+static int lte_connect(void)
 {
 	int err;
 
 	LOG_INF("Connecting to LTE network");
 
+	k_sem_reset(&lte_ready);
+
 	err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_ACTIVATE_LTE);
 	if (err) {
 		LOG_ERR("Failed to activate LTE, error: %d", err);
-		return;
+		return err;
 	}
 
-	k_sem_take(&lte_ready, K_FOREVER);
+	if (k_sem_take(&lte_ready, K_SECONDS(CONFIG_TRACKER_LTE_TIMEOUT)) != 0) {
+		LOG_ERR("Timed out waiting for LTE registration");
+		return -ETIMEDOUT;
+	}
 
 	/* Wait for a while, because with IPv4v6 PDN the IPv6 activation takes a bit more time. */
 	k_sleep(K_SECONDS(1));
+
+	return 0;
 }
 
-void lte_disconnect(void)
+static void lte_disconnect(void)
 {
 	int err;
 
@@ -231,8 +266,8 @@ void lte_disconnect(void)
 
 	LOG_INF("LTE disconnected");
 }
-#endif /* CONFIG_GNSS_SAMPLE_LTE_ON_DEMAND */
 
+#if !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE)
 static const char *get_system_string(uint8_t system_id)
 {
 	switch (system_id) {
@@ -319,6 +354,70 @@ static void agnss_data_get_work_fn(struct k_work *item)
 	requesting_assistance = false;
 }
 #endif /* !CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE */
+
+static int position_send(const char *payload, size_t len)
+{
+	struct sockaddr_in server = {
+		.sin_family = AF_INET,
+		.sin_port = htons(CONFIG_TRACKER_SERVER_PORT),
+	};
+	int fd;
+	int err = 0;
+
+	if (inet_pton(AF_INET, CONFIG_TRACKER_SERVER_ADDR, &server.sin_addr) != 1) {
+		LOG_ERR("Invalid server address \"%s\", check CONFIG_TRACKER_SERVER_ADDR",
+			CONFIG_TRACKER_SERVER_ADDR);
+		return -EINVAL;
+	}
+
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) {
+		LOG_ERR("Failed to create UDP socket, errno: %d", errno);
+		return -errno;
+	}
+
+	if (sendto(fd, payload, len, 0, (struct sockaddr *)&server, sizeof(server)) < 0) {
+		LOG_ERR("Failed to send UDP packet, errno: %d", errno);
+		err = -errno;
+	}
+
+	(void)close(fd);
+
+	return err;
+}
+
+static void position_tx_work_fn(struct k_work *item)
+{
+	ARG_UNUSED(item);
+
+	struct nrf_modem_gnss_pvt_data_frame pvt = last_valid_pvt;
+	char payload[TX_PAYLOAD_SIZE];
+	int len;
+
+	if (!(pvt.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID)) {
+		LOG_WRN("No valid fix to report");
+		return;
+	}
+
+	len = snprintf(payload, sizeof(payload),
+		       "{\"lat\":%.06f,\"lon\":%.06f,\"acc\":%.01f,\"alt\":%.01f,"
+		       "\"ts\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\"}",
+		       pvt.latitude, pvt.longitude, (double)pvt.accuracy, (double)pvt.altitude,
+		       pvt.datetime.year, pvt.datetime.month, pvt.datetime.day,
+		       pvt.datetime.hour, pvt.datetime.minute, pvt.datetime.seconds);
+	if (len < 0 || (size_t)len >= sizeof(payload)) {
+		LOG_ERR("Failed to format position payload");
+		return;
+	}
+
+	LOG_INF("Reporting position: %s", payload);
+
+	if (lte_connect() == 0 && position_send(payload, len) == 0) {
+		LOG_INF("Position sent");
+	}
+
+	lte_disconnect();
+}
 
 #if defined(CONFIG_GNSS_SAMPLE_MODE_TTFF_TEST)
 static void ttff_test_got_fix_work_fn(struct k_work *item)
@@ -449,9 +548,9 @@ static int modem_init(void)
 		date_time_register_handler(date_time_evt_handler);
 	}
 
-#if defined(CONFIG_GNSS_SAMPLE_LTE_ON_DEMAND)
 	lte_lc_register_handler(lte_lc_event_handler);
-#elif !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE)
+
+#if !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE) && !defined(CONFIG_GNSS_SAMPLE_LTE_ON_DEMAND)
 	LOG_INF("Connecting to LTE network");
 
 	if (lte_lc_connect() != 0) {
@@ -479,6 +578,19 @@ static int modem_init(void)
 static int sample_init(void)
 {
 	int err = 0;
+
+	struct k_work_queue_config tx_cfg = {
+		.name = "tx_work_q",
+		.no_yield = false
+	};
+
+	k_work_queue_start(
+		&tx_work_q,
+		tx_workq_stack_area,
+		K_THREAD_STACK_SIZEOF(tx_workq_stack_area),
+		TX_WORKQ_THREAD_PRIORITY,
+		&tx_cfg);
+	k_work_init(&position_tx_work, position_tx_work_fn);
 
 #if !defined(CONFIG_GNSS_SAMPLE_ASSISTANCE_NONE) || defined(CONFIG_GNSS_SAMPLE_MODE_TTFF_TEST)
 	struct k_work_queue_config cfg = {
@@ -696,19 +808,44 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 	       pvt_data->latitude, pvt_data->longitude);
 }
 
+#if defined(CONFIG_SOFTSIM_FACTORY_RESET_ON_PROVISION)
+static void drain_logs_and_reboot(void)
+{
+	/* Flush the deferred log buffer over UART before the reboot discards it. */
+	while (log_data_pending()) {
+		log_process();
+		k_yield();
+	}
+	sys_reboot(0);
+}
+#endif /* CONFIG_SOFTSIM_FACTORY_RESET_ON_PROVISION */
+
 int main(void)
 {
 	int err;
 	uint8_t cnt = 0;
 	struct nrf_modem_gnss_nmea_data_frame *nmea_data;
 
-	LOG_INF("Starting GNSS sample");
+	LOG_INF("Starting GNSS tracker");
 
 	err = nrf_modem_lib_init();
 	if (err) {
 		LOG_ERR("Modem library initialization failed, error: %d", err);
 		return err;
 	}
+
+	/* With CONFIG_SOFTSIM_STATIC_PROFILE_ENABLE the profile is provisioned before main(). */
+	if (!nrf_softsim_check_provisioned()) {
+		LOG_WRN("No SoftSIM profile provisioned, LTE will not attach");
+	}
+
+#if defined(CONFIG_SOFTSIM_FACTORY_RESET_ON_PROVISION)
+	/* Wipe the modem NVM once, right after the first provisioning, then reboot. */
+	if (nrf_softsim_just_provisioned()) {
+		nrf_softsim_modem_factory_reset();
+		drain_logs_and_reboot();
+	}
+#endif /* CONFIG_SOFTSIM_FACTORY_RESET_ON_PROVISION */
 
 	/* Initialize reference coordinates (if used). */
 	if (sizeof(CONFIG_GNSS_SAMPLE_REFERENCE_LATITUDE) > 1 &&
